@@ -190,6 +190,7 @@ func (msg *protocolMessage) String() string {
 }
 
 type conn interface {
+	BytesRecv() uint64
 
 	// Send write the given ProtocolMessage to the connection.
 	// It is expected to block until whole message is written.

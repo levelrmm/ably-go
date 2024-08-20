@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/url"
+	"sync"
 	"time"
 
 	"github.com/ably/ably-go/ably/internal/ablyutil"
@@ -22,6 +23,12 @@ const (
 type websocketConn struct {
 	conn  *websocket.Conn
 	proto proto
+	recv  uint64
+	mu    sync.Mutex
+}
+
+func (ws *websocketConn) BytesRecv() uint64 {
+	return ws.recv
 }
 
 func (ws *websocketConn) Send(msg *protocolMessage) error {
@@ -58,6 +65,11 @@ func (ws *websocketConn) Receive(deadline time.Time) (*protocolMessage, error) {
 	if err != nil {
 		return nil, err
 	}
+
+	ws.mu.Lock()
+	ws.recv += uint64(len(data))
+	ws.mu.Unlock()
+
 	switch ws.proto {
 	case jsonProto:
 		err := json.Unmarshal(data, msg)

@@ -30,6 +30,9 @@ const (
 // Connection represents a single connection Realtime instantiates for communication with Ably servers.
 // It also enables the management of a connection to Ably.
 type Connection struct {
+	recv   uint64
+	recvMu sync.Mutex
+
 	mtx sync.Mutex
 
 	// connMtx - on setConn we write to conn with mtx protection, however in eventLoop we
@@ -124,6 +127,13 @@ func newConn(opts *clientOptions, auth *Auth, callbacks connCallbacks) *Connecti
 		}()
 	}
 	return c
+}
+
+func (c *Connection) BytesRecv() uint64 {
+	c.recvMu.Lock()
+	defer c.recvMu.Unlock()
+
+	return c.recv
 }
 
 func (c *Connection) dial(proto string, u *url.URL) (conn conn, err error) {
@@ -725,7 +735,11 @@ func (c *Connection) eventloop() {
 		}
 		c.connMtx.Lock()
 		msg, err := c.conn.Receive(c.opts.Now().Add(receiveTimeout))
+		c.recvMu.Lock()
+		c.recv += c.conn.BytesRecv()
+		c.recvMu.Unlock()
 		c.connMtx.Unlock()
+
 		if err != nil {
 			c.mtx.Lock()
 			if c.state == ConnectionStateClosing {
@@ -962,6 +976,10 @@ func (c *Connection) lockedReauthorizationFailed(err error) {
 type verboseConn struct {
 	conn   conn
 	logger logger
+}
+
+func (vc verboseConn) BytesRecv() uint64 {
+	return vc.conn.BytesRecv()
 }
 
 func (vc verboseConn) Send(msg *protocolMessage) error {
