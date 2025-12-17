@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"math/rand"
 	"mime"
 	"net/http"
@@ -132,9 +131,10 @@ type REST struct {
 	//Channels is a [ably.RESTChannels] object (RSN1).
 	Channels *RESTChannels
 
-	opts                *clientOptions
-	successFallbackHost *fallbackCache
-	log                 logger
+	opts               *clientOptions
+	hostCache          *hostCache
+	activeRealtimeHost string // RTN17e
+	log                logger
 }
 
 // NewREST construct a RestClient object using an [ably.ClientOption] object to configure
@@ -156,7 +156,7 @@ func NewREST(options ...ClientOption) (*REST, error) {
 		chans:  make(map[string]*RESTChannel),
 		client: c,
 	}
-	c.successFallbackHost = &fallbackCache{
+	c.hostCache = &hostCache{
 		duration: c.opts.fallbackRetryTimeout(),
 	}
 	return c, nil
@@ -191,6 +191,10 @@ func (c *REST) Time(ctx context.Context) (time.Time, error) {
 func (c *REST) Stats(o ...StatsOption) StatsRequest {
 	params := (&statsOptions{}).apply(o...)
 	return StatsRequest{r: c.newPaginatedRequest("/stats", "", params)}
+}
+
+func (c *REST) setActiveRealtimeHost(realtimeHost string) {
+	c.activeRealtimeHost = realtimeHost
 }
 
 // A StatsOption configures a call to REST.Stats or Realtime.Stats.
@@ -632,83 +636,25 @@ func (c *REST) do(ctx context.Context, r *request) (*http.Response, error) {
 	return c.doWithHandle(ctx, r, c.handleResponse)
 }
 
-// fallbackCache caches a successful fallback host for 10 minutes.
-type fallbackCache struct {
-	running  bool
-	host     string
-	duration time.Duration
-	cancel   func()
-	mu       sync.RWMutex
-}
-
-func (f *fallbackCache) get() string {
-	if f.isRunning() {
-		f.mu.RLock()
-		h := f.host
-		f.mu.RUnlock()
-		return h
-	}
-	return ""
-}
-
-func (f *fallbackCache) isRunning() bool {
-	f.mu.RLock()
-	v := f.running
-	f.mu.RUnlock()
-	return v
-}
-
-func (f *fallbackCache) run(host string) {
-	f.mu.Lock()
-	now := time.Now()
-	duration := defaultOptions.FallbackRetryTimeout // spec RSC15f
-	if f.duration != 0 {
-		duration = f.duration
-	}
-	ctx, cancel := context.WithDeadline(context.Background(), now.Add(duration))
-	f.running = true
-	f.host = host
-	f.cancel = cancel
-	f.mu.Unlock()
-	<-ctx.Done()
-	f.mu.Lock()
-	f.running = false
-	f.mu.Unlock()
-}
-
-func (f *fallbackCache) stop() {
-	f.cancel()
-	// we make sure we have stopped
-	for {
-		if !f.isRunning() {
-			return
-		}
-	}
-}
-
-func (f *fallbackCache) put(host string) {
-	if f.get() != host {
-		if f.isRunning() {
-			f.stop()
-		}
-		go f.run(host)
-	}
-}
-
 func (c *REST) doWithHandle(ctx context.Context, r *request, handle func(*http.Response, interface{}) (*http.Response, error)) (*http.Response, error) {
 	req, err := c.newHTTPRequest(ctx, r)
 	if err != nil {
 		return nil, err
 	}
-	if h := c.successFallbackHost.get(); h != "" {
+	if h := c.hostCache.get(); h != "" {
 		req.URL.Host = h // RSC15f
-		c.log.Verbosef("RestClient: setting URL.Host=%q", h)
+		c.log.Verbosef("RestClient: setting cached URL.Host=%q", h)
+	} else if !empty(c.activeRealtimeHost) { // RTN17e
+		req.URL.Host = c.activeRealtimeHost
+		c.log.Verbosef("RestClient: setting activeRealtimeHost URL.Host=%q", c.activeRealtimeHost)
 	}
+
 	if c.opts.Trace != nil {
 		req = req.WithContext(httptrace.WithClientTrace(req.Context(), c.opts.Trace))
 		c.log.Verbose("RestClient: enabling httptrace")
 	}
 	resp, err := c.opts.httpclient().Do(req)
+	serverResp := resp
 	if err == nil {
 		resp, err = handle(resp, r.Out)
 	} else {
@@ -716,70 +662,69 @@ func (c *REST) doWithHandle(ctx context.Context, r *request, handle func(*http.R
 	}
 	if err != nil {
 		c.log.Error("RestClient: error handling response: ", err)
-		if e, ok := err.(*ErrorInfo); ok {
-			if canFallBack(e.StatusCode, resp) {
-				fallbacks, _ := c.opts.getFallbackHosts()
-				c.log.Infof("RestClient: trying to fallback with hosts=%v", fallbacks)
-				if len(fallbacks) > 0 {
-					left := fallbacks
-					iteration := 0
-					maxLimit := c.opts.HTTPMaxRetryCount
-					if maxLimit == 0 {
-						maxLimit = defaultOptions.HTTPMaxRetryCount
-					}
-					c.log.Infof("RestClient: maximum fallback retry limit=%d", maxLimit)
-
-					for {
-						if len(left) == 0 {
-							c.log.Errorf("RestClient: exhausted fallback hosts", err)
-							return nil, err
-						}
-						var h string
-						if len(left) == 1 {
-							h = left[0]
-						} else {
-							h = left[rand.Intn(len(left)-1)]
-						}
-						var n []string
-						for _, v := range left {
-							if v != h {
-								n = append(n, v)
-							}
-						}
-						left = n
-						req, err := c.newHTTPRequest(ctx, r)
-						if err != nil {
-							return nil, err
-						}
-						c.log.Infof("RestClient:  chose fallback host=%q ", h)
-						req.URL.Host = h
-						req.Host = ""
-						req.Header.Set(hostHeader, h)
-						resp, err := c.opts.httpclient().Do(req)
-						if err == nil {
-							resp, err = handle(resp, r.Out)
-						} else {
-							c.log.Error("RestClient: failed sending a request to a fallback host", err)
-						}
-						if err != nil {
-							c.log.Error("RestClient: error handling response: ", err)
-							if iteration == maxLimit-1 {
-								return nil, err
-							}
-							if ev, ok := err.(*ErrorInfo); ok {
-								if canFallBack(ev.StatusCode, resp) {
-									iteration++
-									continue
-								}
-							}
-							return nil, err
-						}
-						c.successFallbackHost.put(h)
-						return resp, nil
-					}
+		if canFallBack(err, serverResp) {
+			fallbacks, _ := c.opts.getFallbackHosts()
+			c.log.Infof("RestClient: trying to fallback with hosts=%v", fallbacks)
+			if len(fallbacks) > 0 {
+				left := fallbacks
+				iteration := 0
+				maxLimit := c.opts.HTTPMaxRetryCount
+				if maxLimit == 0 {
+					maxLimit = defaultOptions.HTTPMaxRetryCount
 				}
-				return nil, err
+				c.log.Infof("RestClient: maximum fallback retry limit=%d", maxLimit)
+
+				for {
+					if len(left) == 0 {
+						c.log.Errorf("RestClient: exhausted fallback hosts", err)
+						return nil, err
+					}
+					var h string
+					if len(left) == 1 {
+						h = left[0]
+					} else {
+						h = left[rand.Intn(len(left)-1)]
+					}
+					var n []string
+					for _, v := range left {
+						if v != h {
+							n = append(n, v)
+						}
+					}
+					left = n
+					req, err := c.newHTTPRequest(ctx, r)
+					if err != nil {
+						return nil, err
+					}
+					c.log.Infof("RestClient:  chose fallback host=%q ", h)
+					req.URL.Host = h
+					req.Host = ""
+					req.Header.Set(hostHeader, h)
+					resp, err := c.opts.httpclient().Do(req)
+					serverResp := resp
+					if err == nil {
+						resp, err = handle(resp, r.Out)
+					} else {
+						c.log.Error("RestClient: failed sending a request to a fallback host", err)
+					}
+					if err != nil {
+						c.log.Error("RestClient: error handling response: ", err)
+						if iteration == maxLimit-1 {
+							return nil, err
+						}
+						if canFallBack(err, serverResp) {
+							iteration++
+							continue
+						}
+						return nil, err
+					}
+					c.hostCache.put(h)
+					return resp, nil
+				}
 			}
+			return nil, err
+		}
+		if e, ok := err.(*ErrorInfo); ok {
 			if e.Code == ErrTokenErrorUnspecified {
 				if r.NoRenew || !c.Auth.isTokenRenewable() {
 					return nil, err
@@ -796,9 +741,24 @@ func (c *REST) doWithHandle(ctx context.Context, r *request, handle func(*http.R
 	return resp, nil
 }
 
-func canFallBack(statusCode int, res *http.Response) bool {
-	return (statusCode >= http.StatusInternalServerError && statusCode <= http.StatusGatewayTimeout) ||
-		(res != nil && strings.EqualFold(res.Header.Get("Server"), "CloudFront") && statusCode >= http.StatusBadRequest) // RSC15l4
+func canFallBack(err error, res *http.Response) bool {
+	return isStatusCodeBetween500_504(res) || // RSC15l3
+		isCloudFrontError(res) || //RSC15l4
+		isTimeoutOrDnsErr(err) //RSC15l1, RSC15l2
+}
+
+// RSC15l3
+func isStatusCodeBetween500_504(res *http.Response) bool {
+	return res != nil &&
+		res.StatusCode >= http.StatusInternalServerError &&
+		res.StatusCode <= http.StatusGatewayTimeout
+}
+
+// RSC15l4
+func isCloudFrontError(res *http.Response) bool {
+	return res != nil &&
+		strings.EqualFold(res.Header.Get("Server"), "CloudFront") &&
+		res.StatusCode >= http.StatusBadRequest
 }
 
 // newHTTPRequest creates a new http.Request that can be sent to ably endpoints.
@@ -824,9 +784,9 @@ func (c *REST) newHTTPRequest(ctx context.Context, r *request) (*http.Request, e
 	if r.header != nil {
 		copyHeader(req.Header, r.header)
 	}
-	req.Header.Set("Accept", protocol) //spec RSC19c
-	req.Header.Set(ablyVersionHeader, ablyVersion)
-	req.Header.Set(ablyAgentHeader, ablyAgentIdentifier(c.opts.Agents))
+	req.Header.Set("Accept", protocol)                                  // RSC19c
+	req.Header.Set(ablyProtocolVersionHeader, ablyProtocolVersion)      // RSC7a
+	req.Header.Set(ablyAgentHeader, ablyAgentIdentifier(c.opts.Agents)) // RSC7d
 	if c.opts.ClientID != "" && c.Auth.method == authBasic {
 		// References RSA7e2
 		h := base64.StdEncoding.EncodeToString([]byte(c.opts.ClientID))
@@ -876,13 +836,13 @@ func decode(typ string, r io.Reader, out interface{}) error {
 	case "application/json":
 		return json.NewDecoder(r).Decode(out)
 	case "application/x-msgpack":
-		b, err := ioutil.ReadAll(r)
+		b, err := io.ReadAll(r)
 		if err != nil {
 			return err
 		}
 		return ablyutil.UnmarshalMsgpack(b, out)
 	case "text/plain":
-		p, err := ioutil.ReadAll(r)
+		p, err := io.ReadAll(r)
 		if err != nil {
 			return err
 		}
@@ -899,7 +859,33 @@ func decodeResp(resp *http.Response, out interface{}) error {
 	if err != nil {
 		return err
 	}
-	b, _ := ioutil.ReadAll(resp.Body)
+	b, _ := io.ReadAll(resp.Body)
 
 	return decode(typ, bytes.NewReader(b), out)
+}
+
+// hostCache caches a successful fallback host for 10 minutes.
+// Only used by REST client while making requests RSC15f
+type hostCache struct {
+	duration time.Duration
+
+	sync.RWMutex
+	deadline time.Time
+	host     string
+}
+
+func (c *hostCache) put(host string) {
+	c.Lock()
+	defer c.Unlock()
+	c.host = host
+	c.deadline = time.Now().Add(c.duration)
+}
+
+func (c *hostCache) get() string {
+	c.RLock()
+	defer c.RUnlock()
+	if ablyutil.Empty(c.host) || time.Until(c.deadline) <= 0 {
+		return ""
+	}
+	return c.host
 }

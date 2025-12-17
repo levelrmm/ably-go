@@ -47,11 +47,40 @@ func newChannels(client *Realtime) *RealtimeChannels {
 	}
 }
 
+// RTN16j, RTL15b
+func (channels *RealtimeChannels) SetChannelSerialsFromRecoverOption(serials map[string]string) {
+	for channelName, channelSerial := range serials {
+		channel := channels.Get(channelName)
+		channel.setChannelSerial(channelSerial)
+	}
+}
+
+func (channels *RealtimeChannels) GetChannelSerials() map[string]string {
+	channels.mtx.Lock()
+	defer channels.mtx.Unlock()
+	channelSerials := make(map[string]string)
+	for channelName, realtimeChannel := range channels.chans {
+		if realtimeChannel.State() == ChannelStateAttached {
+			channelSerials[channelName] = realtimeChannel.getChannelSerial()
+		}
+	}
+	return channelSerials
+}
+
 // ChannelOption configures a channel.
 type ChannelOption func(*channelOptions)
 
 // channelOptions wraps ChannelOptions. It exists so that users can't implement their own ChannelOption.
 type channelOptions protoChannelOptions
+
+func (o *channelOptions) isDeltaEncodingEnabled() bool {
+	if o.Params != nil {
+		if val, ok := o.Params["delta"]; ok && val == "vcdiff" {
+			return true
+		}
+	}
+	return false
+}
 
 // DeriveOptions allows options to be used in creating a derived channel
 type DeriveOptions struct {
@@ -85,6 +114,17 @@ func ChannelWithParams(key string, value string) ChannelOption {
 			o.Params = map[string]string{}
 		}
 		o.Params[key] = value
+	}
+}
+
+// ChannelWithVCDiff sets channel parameters for VCDIFF delta compression.
+// This is a convenience method that internally sets "delta" to "vcdiff" parameters.
+func ChannelWithVCDiff() ChannelOption {
+	return func(o *channelOptions) {
+		if o.Params == nil {
+			o.Params = map[string]string{}
+		}
+		o.Params["delta"] = "vcdiff"
 	}
 }
 
@@ -204,6 +244,16 @@ type RealtimeChannel struct {
 	// Presence is a [ably.RealtimePresence] object, provides for entering and leaving client presence (RTL9).
 	Presence *RealtimePresence
 
+	// ExperimentalObjects returns an experimental implementation of [LiveObjects] functionality
+	// capable of publishing and receiving object changes.
+	//
+	// NOTE: this method is experimental, the LiveObjects plugin API may change in a
+	// backwards incompatible way between minor/patch versions. Once the API has been finalised,
+	// a new non-experimental method will be added, and this one will be removed.
+	//
+	// [LiveObjects]: https://ably.com/docs/liveobjects
+	ExperimentalObjects *RealtimeExperimentalObjects
+
 	// state is the current [ably.ChannelState] of the channel (RTL2b).
 	state ChannelState
 
@@ -214,6 +264,7 @@ type RealtimeChannel struct {
 
 	client         *Realtime
 	messageEmitter *eventEmitter
+	errorEmitter   *eventEmitter
 	queue          *msgQueue
 	options        *channelOptions
 
@@ -226,6 +277,16 @@ type RealtimeChannel struct {
 	//attachResume is True when the channel moves to the ChannelStateAttached state, and False
 	//when the channel moves to the ChannelStateDetaching or ChannelStateFailed states.
 	attachResume bool
+
+	properties ChannelProperties
+
+	// Delta support fields (RTL19, RTL20)
+	// lastPayloadProtocolMessageChannelSerial stores the channel serial of the last received message for delta validation (RTL20).
+	lastPayloadProtocolMessageChannelSerial string
+	// decodeFailureRecoveryInProgress indicates whether the channel is currently recovering from a delta decode failure (RTL18).
+	decodeFailureRecoveryInProgress bool
+	// decodingContext provides context for delta decoding including plugin access.
+	decodingContext *DecodingContext
 }
 
 func newRealtimeChannel(name string, client *Realtime, chOptions *channelOptions) *RealtimeChannel {
@@ -239,9 +300,17 @@ func newRealtimeChannel(name string, client *Realtime, chOptions *channelOptions
 		client:         client,
 		messageEmitter: newEventEmitter(client.log()),
 		options:        chOptions,
+		properties:     ChannelProperties{},
 	}
 	c.Presence = newRealtimePresence(c)
 	c.queue = newMsgQueue(client.Connection)
+	c.ExperimentalObjects = newRealtimeExperimentalObjects(c)
+
+	// Initialize delta decoding context
+	c.decodingContext = &DecodingContext{
+		VCDiffPlugin: client.opts().VCDiffPlugin,
+	}
+
 	return c
 }
 
@@ -329,6 +398,11 @@ func (c *RealtimeChannel) lockAttach(err error) (result, error) {
 		msg := &protocolMessage{
 			Action:  actionAttach,
 			Channel: c.Name,
+		}
+		msg.ChannelSerial = c.properties.ChannelSerial // RTL4c1, accessing locked
+		if c.decodeFailureRecoveryInProgress {
+			c.log().Verbosef("Delta decode failure recovery in progress, resetting ChannelSerial for channel %q", c.Name)
+			msg.ChannelSerial = c.lastPayloadProtocolMessageChannelSerial
 		}
 		if len(c.channelOpts().Params) > 0 {
 			msg.Params = c.channelOpts().Params
@@ -454,6 +528,18 @@ func (c *RealtimeChannel) sendDetachMsg() (result, error) {
 func (c *RealtimeChannel) detachUnsafe() (result, error) {
 	c.lockSetState(ChannelStateDetaching, nil, false) // no need to check for locks, method is already under lock context
 	return c.sendDetachMsg()
+}
+
+func (c *RealtimeChannel) getClientOptions() *clientOptions {
+	if c.client == nil {
+		return nil
+	}
+
+	return c.client.opts()
+}
+
+func (c *RealtimeChannel) getName() string {
+	return c.Name
 }
 
 type subscriptionName string
@@ -653,6 +739,33 @@ func (c *RealtimeChannel) History(o ...HistoryOption) HistoryRequest {
 	return c.client.rest.Channels.Get(c.Name).History(o...)
 }
 
+// HistoryUntilAttach retrieves a [ably.HistoryRequest] object, containing an array of historical
+// [ably.Message] objects for the channel. If the channel is configured to persist messages,
+// then messages can be retrieved from history for up to 72 hours in the past. If not, messages can only be
+// retrieved from history for up to two minutes in the past.
+//
+// This function will only retrieve messages prior to the moment that the channel was attached or emitted an UPDATE
+// indicating loss of continuity. This bound is specified by passing the querystring param fromSerial with the RealtimeChannel#properties.attachSerial
+// assigned to the channel in the ATTACHED ProtocolMessage (see RTL15a).
+// If the untilAttach param is specified when the channel is not attached, it results in an error.
+//
+// See package-level documentation => [ably] Pagination for details about history pagination.
+func (c *RealtimeChannel) HistoryUntilAttach(o ...HistoryOption) (*HistoryRequest, error) {
+	if c.state != ChannelStateAttached {
+		return nil, errors.New("channel is not attached, cannot use attachSerial value in fromSerial param")
+	}
+
+	untilAttachParam := func(o *historyOptions) {
+		c.mtx.Lock()
+		o.params.Set("fromSerial", c.properties.AttachSerial)
+		c.mtx.Unlock()
+	}
+	o = append(o, untilAttachParam)
+
+	historyRequest := c.client.rest.Channels.Get(c.Name).History(o...)
+	return &historyRequest, nil
+}
+
 func (c *RealtimeChannel) send(msg *protocolMessage, onAck func(err error)) error {
 	if enqueued := c.maybeEnqueue(msg, onAck); enqueued {
 		return nil
@@ -724,9 +837,20 @@ func (c *RealtimeChannel) ErrorReason() *ErrorInfo {
 }
 
 func (c *RealtimeChannel) notify(msg *protocolMessage) {
+	// RTL15b
+	if !empty(msg.ChannelSerial) && (msg.Action == actionMessage ||
+		msg.Action == actionPresence || msg.Action == actionAttached) {
+		c.log().Debugf("Setting channel serial for channelName - %v, previous - %v, current - %v",
+			c.Name, c.getChannelSerial(), msg.ChannelSerial)
+		c.setChannelSerial(msg.ChannelSerial)
+	}
+
 	switch msg.Action {
 	case actionAttached:
-		if c.State() == ChannelStateDetaching { // RTL5K
+		c.mtx.Lock()
+		c.properties.AttachSerial = msg.ChannelSerial // RTL15a
+		c.mtx.Unlock()
+		if c.State() == ChannelStateDetaching || c.State() == ChannelStateDetached { // RTL5K
 			c.sendDetachMsg()
 			return
 		}
@@ -736,9 +860,16 @@ func (c *RealtimeChannel) notify(msg *protocolMessage) {
 		if msg.Flags != 0 {
 			c.setModes(channelModeFromFlag(msg.Flags))
 		}
-		c.Presence.onAttach(msg)
-		// RTL12
-		c.setState(ChannelStateAttached, newErrorFromProto(msg.Error), msg.Flags.Has(flagResumed))
+
+		if c.State() == ChannelStateAttached {
+			if !msg.Flags.Has(flagResumed) { // RTL12
+				c.Presence.onAttach(msg)
+				c.emitErrorUpdate(newErrorFromProto(msg.Error), false)
+			}
+		} else {
+			c.Presence.onAttach(msg)
+			c.setState(ChannelStateAttached, newErrorFromProto(msg.Error), msg.Flags.Has(flagResumed))
+		}
 		c.queue.Flush()
 	case actionDetached:
 		c.mtx.Lock()
@@ -748,7 +879,7 @@ func (c *RealtimeChannel) notify(msg *protocolMessage) {
 			c.lockSetState(ChannelStateDetached, err, false)
 			c.mtx.Unlock()
 			return
-		case ChannelStateAttached: // TODO: Also SUSPENDED; RTL13a
+		case ChannelStateAttached, ChannelStateSuspended: // RTL13a
 			var res result
 			res, err = c.lockAttach(err)
 			if err != nil {
@@ -779,19 +910,96 @@ func (c *RealtimeChannel) notify(msg *protocolMessage) {
 
 		c.lockStartRetryAttachLoop(err)
 	case actionSync:
-		c.Presence.processIncomingMessage(msg, syncSerial(msg))
+		c.Presence.processProtoSyncMessage(msg) // RTP18
 	case actionPresence:
-		c.Presence.processIncomingMessage(msg, "")
+		c.Presence.processProtoPresenceMessage(msg)
 	case actionError:
 		c.setState(ChannelStateFailed, newErrorFromProto(msg.Error), false)
 		c.queue.Fail(newErrorFromProto(msg.Error))
 	case actionMessage:
 		if c.State() == ChannelStateAttached {
+			if c.options.isDeltaEncodingEnabled() {
+				firstMsg := msg.Messages[0]
+				serverStoredLastMessageId := extractDeltaExtras(firstMsg.Extras).From
+				lastMessageId := c.decodingContext.LastMessageID
+				if !empty(serverStoredLastMessageId) && serverStoredLastMessageId != lastMessageId {
+					// RTL18: Delta decode failure recovery
+					decodingErr := newErrorf(ErrDeltaDecodingFailed, "Delta decode failure on channel %q: expected message ID %q, got %q", c.Name, lastMessageId, serverStoredLastMessageId)
+					c.client.log().Error(decodingErr)
+					c.startDecodeFailureRecovery(decodingErr)
+					return
+				}
+				// Process message with delta support (RTL18, RTL19, RTL20)
+				for _, innerMsg := range msg.Messages {
+					var cipher channelCipher
+					if c.options != nil {
+						cipher, _ = (*protoChannelOptions)(c.options).GetCipher()
+					}
+					decodedMsg, err := innerMsg.withDecodedDataAndContext(cipher, c.decodingContext)
+					if err != nil {
+						if code(err) == ErrDeltaDecodingFailed {
+							// RTL18: Delta decode failure recovery
+							c.client.log().Errorf("Delta decode failure on channel %q: %v", c.Name, err)
+							c.startDecodeFailureRecovery(err)
+							return
+						}
+						// For other errors, just log and continue (RSL6b)
+						c.client.log().Warnf("Message decode error on channel %q: %v", c.Name, err)
+					}
+					*innerMsg = decodedMsg // Update message with decoded data
+				}
+				lastMsg := msg.Messages[len(msg.Messages)-1]
+				c.decodingContext.LastMessageID = lastMsg.ID
+				c.lastPayloadProtocolMessageChannelSerial = msg.ChannelSerial
+			}
 			for _, msg := range msg.Messages {
 				c.messageEmitter.Emit(subscriptionName(msg.Name), (*subscriptionMessage)(msg))
 			}
+		} else {
+			errorMsgPrefix := "Message skipped on a channel that is not ATTACHED."
+			if c.decodeFailureRecoveryInProgress {
+				errorMsgPrefix = "Delta recovery in progress - message skipped."
+			}
+
+			// log messages skipped per RTL17
+			for _, skippedMessage := range msg.Messages {
+				c.log().Verbosef("%s Message id = %s, channel = %s", errorMsgPrefix, skippedMessage.ID, c.Name)
+			}
+		}
+	case actionObject:
+		if plugin := c.client.opts().ExperimentalObjectsPlugin; plugin != nil {
+			plugin.HandleObjectMessages(msg.State)
+		}
+	case actionObjectSync:
+		if plugin := c.client.opts().ExperimentalObjectsPlugin; plugin != nil {
+			plugin.HandleObjectSyncMessages(msg.State, msg.ChannelSerial)
 		}
 	default:
+	}
+}
+
+// startDecodeFailureRecovery implements the RTL18 recovery procedure.
+func (c *RealtimeChannel) startDecodeFailureRecovery(reason error) {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	if c.decodeFailureRecoveryInProgress {
+		return
+	}
+	c.client.log().Warnf("Starting delta decode failure recovery process %q", c.Name)
+	c.decodeFailureRecoveryInProgress = true
+
+	// Doesn't matter if attach succeeded or failed. Even if attach fails,
+	// recovery using lastMessage channelSerial will be re-tried on next attach
+	res, err := c.lockAttach(reason)
+	if err != nil {
+		c.decodeFailureRecoveryInProgress = false
+	} else {
+		go func() {
+			res.Wait(context.Background())
+			c.mtx.Lock()
+			c.decodeFailureRecoveryInProgress = false
+			c.mtx.Unlock()
+		}()
 	}
 }
 
@@ -850,6 +1058,18 @@ func (c *RealtimeChannel) setParams(params channelParams) {
 	c.params = params
 }
 
+func (c *RealtimeChannel) setChannelSerial(serial string) {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	c.properties.ChannelSerial = serial
+}
+
+func (c *RealtimeChannel) getChannelSerial() string {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	return c.properties.ChannelSerial
+}
+
 func (c *RealtimeChannel) setModes(modes []ChannelMode) {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
@@ -885,6 +1105,20 @@ func (c *RealtimeChannel) log() logger {
 func (c *RealtimeChannel) setState(state ChannelState, err error, resumed bool) error {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
+
+	// RTP5a
+	if state == ChannelStateDetached || state == ChannelStateFailed {
+		c.Presence.onChannelDetachedOrFailed(channelStateError(state, err))
+	}
+	// RTP5a1
+	if state == ChannelStateDetached || state == ChannelStateSuspended || state == ChannelStateFailed {
+		c.properties.ChannelSerial = "" // setting on already locked method
+	}
+	// RTP5f
+	if state == ChannelStateSuspended {
+		c.Presence.onChannelSuspended(channelStateError(state, err))
+	}
+
 	return c.lockSetState(state, err, resumed)
 }
 
@@ -900,6 +1134,17 @@ func (c *RealtimeChannel) lockSetAttachResume(state ChannelState) {
 	}
 }
 
+func (c *RealtimeChannel) emitErrorUpdate(err *ErrorInfo, resumed bool) {
+	change := ChannelStateChange{
+		Current:  c.state,
+		Previous: c.state,
+		Reason:   err,
+		Resumed:  resumed,
+		Event:    ChannelEventUpdate,
+	}
+	c.emitter.Emit(change.Event, change)
+}
+
 func (c *RealtimeChannel) lockSetState(state ChannelState, err error, resumed bool) error {
 	c.lockSetAttachResume(state)
 	previous := c.state
@@ -912,7 +1157,7 @@ func (c *RealtimeChannel) lockSetState(state ChannelState, err error, resumed bo
 		Reason:   c.errorReason,
 		Resumed:  resumed,
 	}
-	// RTL2g
+	// RTL2g, RTL12
 	if !changed {
 		change.Event = ChannelEventUpdate
 	} else {

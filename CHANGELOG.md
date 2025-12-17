@@ -1,6 +1,120 @@
 # Change Log
 
-# Changelog
+## [1.3.0](https://github.com/ably/ably-go/tree/v1.3.0)
+
+[Full Changelog](https://github.com/ably/ably-go/compare/v1.2.22...v1.3.0)
+
+**Closed issues:**
+
+- Implement vcdiff delta support [\#689](https://github.com/ably/ably-go/issues/689)
+
+## [1.2.22](https://github.com/ably/ably-go/tree/v1.2.22)
+
+[Full Changelog](https://github.com/ably/ably-go/compare/v1.2.21...v1.2.22)
+
+**Implemented enhancements:**
+
+- Added support for `endpoint` clientOption, marked other related options as deprecated [\#679](https://github.com/ably/ably-go/pull/679)
+
+**Closed issues:**
+
+- Fix failing test TestRealtime\_RTN17\_Integration\_HostFallback\_Timeout [\#678](https://github.com/ably/ably-go/issues/678)
+
+## [1.2.21](https://github.com/ably/ably-go/tree/v1.2.21)
+
+[Full Changelog](https://github.com/ably/ably-go/compare/v1.2.20...v1.2.21)
+
+**Implemented enhancements:**
+
+- JWT (JSON Web Token) authentication [\#569](https://github.com/ably/ably-go/issues/569)
+
+## [1.2.20](https://github.com/ably/ably-go/tree/v1.2.20)
+
+[Full Changelog](https://github.com/ably/ably-go/compare/v1.2.19...v1.2.20)
+
+**Implemented enhancements:**
+
+- RTN17: Realtime Host fallback [\#225](https://github.com/ably/ably-go/issues/225)
+
+**Closed issues:**
+
+- Rest fallback RSC15 [\#658](https://github.com/ably/ably-go/issues/658)
+- Rest/Realtime proxy support [\#652](https://github.com/ably/ably-go/issues/652)
+- Fix skipped presence integration tests for ENTER, UPDATE and LEAVE [\#651](https://github.com/ably/ably-go/issues/651)
+- RTN22, RTC8: Server-initiated reauth [\#228](https://github.com/ably/ably-go/issues/228)
+
+## [1.2.19](https://github.com/ably/ably-go/tree/v1.2.19)
+
+[Full Changelog](https://github.com/ably/ably-go/compare/v1.2.18...v1.2.19)
+
+**Fixed bugs:**
+
+- A synthetic leave does not trigger the presence event listener callback [\#646](https://github.com/ably/ably-go/issues/646)
+
+**Closed issues:**
+
+- Add CI support for GO 1.21 and 1.22 [\#641](https://github.com/ably/ably-go/issues/641)
+- Update README - Known limitations [\#639](https://github.com/ably/ably-go/issues/639)
+
+## [1.2.18](https://github.com/ably/ably-go/tree/v1.2.18)
+
+[Full Changelog](https://github.com/ably/ably-go/compare/v1.2.17...v1.2.18)
+
+**Fixed bugs:**
+
+- Suspended connection goes to failed state on resume attempt [\#638](https://github.com/ably/ably-go/issues/638)
+
+**Closed issues:**
+
+- Flaky test - TestRealtimePresence\_EnsureChannelIsAttached [\#508](https://github.com/ably/ably-go/issues/508)
+
+## [1.2.17](https://github.com/ably/ably-go/tree/v1.2.17)
+
+[Full Changelog](https://github.com/ably/ably-go/compare/v1.2.16...v1.2.17)
+
+**Merged pull requests:**
+
+- fix: keep client default client read limit when realtime doesn't specify [\#631](https://github.com/ably/ably-go/pull/631) ([AndyTWF](https://github.com/AndyTWF))
+
+## [1.2.16](https://github.com/ably/ably-go/tree/1.2.16)
+
+[Full Changelog](https://github.com/ably/ably-go/compare/v1.2.15...v1.2.16)
+
+**Closed issues:**
+
+- ably-go doesn't retry requests to fallback hosts on a timeout [\#626](https://github.com/ably/ably-go/issues/626)
+
+**Merged pull requests:**
+
+- Fix/host fallback conditions [\#629](https://github.com/ably/ably-go/pull/629) ([sacOO7](https://github.com/sacOO7))
+
+## [1.2.15](https://github.com/ably/ably-go/tree/1.2.15)
+
+[Full Changelog](https://github.com/ably/ably-go/compare/v1.2.14...v1.2.15)
+
+**Closed issues:**
+
+- Implement no connection serial [\#612](https://github.com/ably/ably-go/issues/612)
+- Potential go routine on blocking functions [\#623](https://github.com/ably/ably-go/issues/623)
+- Client gives up on reconnect [\#606](https://github.com/ably/ably-go/issues/606)
+- RTP5: Channel state change side effects on presence [\#259](https://github.com/ably/ably-go/issues/259)
+- RTP18: Server-initiated presence sync [\#256](https://github.com/ably/ably-go/issues/256)
+- RTP2, RTP17, RTP19: PresenceMap [\#255](https://github.com/ably/ably-go/issues/255)
+- RTP1: HAS\_PRESENCE flag [\#248](https://github.com/ably/ably-go/issues/248)
+- RTP16: Presence connection state conditions [\#214](https://github.com/ably/ably-go/issues/214)
+
+**Merged pull requests:**
+
+- \[SDK-222\] \[no connection serial \] + implement missing internal presence map + presencequeue [\#621](https://github.com/ably/ably-go/pull/621) ([sacOO7](https://github.com/sacOO7))
+- \[SDK-3746\] Feature/integration 2.0 [\#613](https://github.com/ably/ably-go/pull/613) ([sacOO7](https://github.com/sacOO7))
+
+## [1.2.14](https://github.com/ably/ably-go/tree/1.2.14)
+
+[Full Changelog](https://github.com/ably/ably-go/compare/v1.2.13...v1.2.14)
+
+**Merged pull requests:**
+
+- Fix message extras unmarshaled to incompatible json type [\#624](https://github.com/ably/ably-go/pull/624) ([zknill](https://github.com/zknill))
 
 ## [1.2.13](https://github.com/ably/ably-go/tree/1.2.13)
 

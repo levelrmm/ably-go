@@ -7,7 +7,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"io/ioutil"
 	"mime"
 	"net/http"
 	"net/url"
@@ -82,7 +81,7 @@ type Auth struct {
 
 	// onExplicitAuthorize is the callback that Realtime sets to reauthorize with the
 	// server when Authorize is explicitly called.
-	onExplicitAuthorize func(context.Context, *TokenDetails)
+	onExplicitAuthorize func(context.Context, *TokenDetails) error
 
 	serverTimeOffset time.Duration
 
@@ -93,7 +92,7 @@ type Auth struct {
 func newAuth(client *REST) (*Auth, error) {
 	a := &Auth{
 		client:              client,
-		onExplicitAuthorize: func(context.Context, *TokenDetails) {},
+		onExplicitAuthorize: func(context.Context, *TokenDetails) error { return nil },
 	}
 	method, err := detectAuthMethod(a.opts())
 	if err != nil {
@@ -314,7 +313,10 @@ func (a *Auth) Authorize(ctx context.Context, params *TokenParams, setOpts ...Au
 	if err != nil {
 		return nil, err
 	}
-	a.onExplicitAuthorize(ctx, token)
+	err = a.onExplicitAuthorize(ctx, token)
+	if err != nil {
+		return nil, err
+	}
 	return token, nil
 }
 
@@ -443,7 +445,7 @@ func (a *Auth) requestAuthURL(ctx context.Context, params *TokenParams, opts *au
 	case "POST":
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		req.Header.Set("Content-Length", strconv.Itoa(len(query)))
-		req.Body = ioutil.NopCloser(strings.NewReader(query))
+		req.Body = io.NopCloser(strings.NewReader(query))
 	default:
 		return nil, a.newError(40500, nil)
 	}
@@ -460,8 +462,8 @@ func (a *Auth) requestAuthURL(ctx context.Context, params *TokenParams, opts *au
 		return nil, a.newError(40004, err)
 	}
 	switch typ {
-	case "text/plain":
-		token, err := ioutil.ReadAll(resp.Body)
+	case "text/plain", "application/jwt":
+		token, err := io.ReadAll(resp.Body)
 		if err != nil {
 			return nil, a.newError(40000, err)
 		}
@@ -543,7 +545,7 @@ func detectAuthMethod(opts *clientOptions) (int, error) {
 	if !isKeyValid {
 		return 0, newError(ErrInvalidCredential, errInvalidKey)
 	}
-	if opts.NoTLS {
+	if opts.NoTLS && !opts.InsecureAllowBasicAuthWithoutTLS {
 		return 0, newError(ErrInvalidUseOfBasicAuthOverNonTLSTransport, errInsecureBasicAuth)
 	}
 	return authBasic, nil

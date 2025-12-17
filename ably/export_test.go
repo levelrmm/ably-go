@@ -12,8 +12,8 @@ func NewClientOptions(os ...ClientOption) *clientOptions {
 	return applyOptionsWithDefaults(os...)
 }
 
-func GetEnvFallbackHosts(env string) []string {
-	return getEnvFallbackHosts(env)
+func GetEndpointFallbackHosts(endpoint string) []string {
+	return getEndpointFallbackHosts(endpoint)
 }
 
 func (opts *clientOptions) GetRestHost() string {
@@ -22,6 +22,14 @@ func (opts *clientOptions) GetRestHost() string {
 
 func (opts *clientOptions) GetRealtimeHost() string {
 	return opts.getRealtimeHost()
+}
+
+func (opts *clientOptions) Validate() error {
+	return opts.validate()
+}
+
+func (opts *clientOptions) GetHostnameFromEndpoint() string {
+	return opts.getHostnameFromEndpoint()
 }
 
 func (opts *clientOptions) ActivePort() (int, bool) {
@@ -34,10 +42,6 @@ func (opts *clientOptions) GetFallbackHosts() ([]string, error) {
 
 func (opts *clientOptions) RestURL() string {
 	return opts.restURL()
-}
-
-func (opts *clientOptions) RealtimeURL() string {
-	return opts.realtimeURL()
 }
 
 func (c *REST) Post(ctx context.Context, path string, in, out interface{}) (*http.Response, error) {
@@ -65,6 +69,10 @@ func UnwrapStatusCode(err error) int {
 	return statusCode(err)
 }
 
+func IsTimeoutOrDnsErr(err error) bool {
+	return isTimeoutOrDnsErr(err)
+}
+
 func (a *Auth) Timestamp(ctx context.Context, query bool) (time.Time, error) {
 	return a.timestamp(ctx, query)
 }
@@ -85,12 +93,18 @@ func (a *Auth) SetServerTimeFunc(st func() (time.Time, error)) {
 	a.serverTimeHandler = st
 }
 
-func (c *REST) SetSuccessFallbackHost(duration time.Duration) {
-	c.successFallbackHost = &fallbackCache{duration: duration}
+func (c *REST) GetCachedFallbackHost() string {
+	return c.hostCache.get()
 }
 
-func (c *REST) GetCachedFallbackHost() string {
-	return c.successFallbackHost.get()
+func (c *REST) ActiveRealtimeHost() string {
+	return c.activeRealtimeHost
+}
+
+func (c *RealtimeChannel) GetChannelSerial() string {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	return c.properties.ChannelSerial
 }
 
 func (c *RealtimeChannel) GetAttachResume() bool {
@@ -105,8 +119,18 @@ func (c *RealtimeChannel) SetAttachResume(value bool) {
 	c.attachResume = value
 }
 
+func (c *RealtimeChannel) SetState(chanState ChannelState) {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	c.state = chanState
+}
+
 func (opts *clientOptions) GetFallbackRetryTimeout() time.Duration {
 	return opts.fallbackRetryTimeout()
+}
+
+func (opts *clientOptions) HasActiveInternetConnection() bool {
+	return opts.hasActiveInternetConnection()
 }
 
 func NewErrorInfo(code ErrorCode, err error) *ErrorInfo {
@@ -134,12 +158,6 @@ func (c *Connection) MsgSerial() int64 {
 	c.mtx.Lock()
 	defer c.mtx.Unlock()
 	return c.msgSerial
-}
-
-func (c *Connection) IsReadLimitSetExternally() bool {
-	c.mtx.Lock()
-	defer c.mtx.Unlock()
-	return c.isReadLimitSetExternally
 }
 
 func (c *Connection) ReadLimit() int64 {
@@ -176,6 +194,10 @@ func ApplyOptionsWithDefaults(o ...ClientOption) *clientOptions {
 	return applyOptionsWithDefaults(o...)
 }
 
+func IsEndpointHostname(endpoint string) bool {
+	return isEndpointHostname(endpoint)
+}
+
 type ConnStateChanges = connStateChanges
 
 type ChannelStateChanges = channelStateChanges
@@ -183,7 +205,7 @@ type ChannelStateChanges = channelStateChanges
 const ConnectionStateTTLErrFmt = connectionStateTTLErrFmt
 
 func DefaultFallbackHosts() []string {
-	return defaultFallbackHosts()
+	return defaultOptions.FallbackHosts
 }
 
 // PendingItems returns the number of messages waiting for Ack/Nack
@@ -193,8 +215,65 @@ func (c *Connection) PendingItems() int {
 	return len(c.pending.queue)
 }
 
+// AckAll empties queue and acks all pending callbacks
+func (c *Connection) AckAll() {
+	c.mtx.Lock()
+	cx := c.pending.Dismiss()
+	c.mtx.Unlock()
+	c.log().Infof("Ack all %d messages waiting for ACK/NACK", len(cx))
+	for _, v := range cx {
+		v.onAck(nil)
+	}
+}
+
+func (c *Connection) SetKey(key string) {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	c.key = key
+}
+
+func (r *Realtime) Rest() *REST {
+	return r.rest
+}
+
+func (c *RealtimePresence) Members() map[string]*PresenceMessage {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	presenceMembers := make(map[string]*PresenceMessage, len(c.members))
+	for k, pm := range c.members {
+		presenceMembers[k] = pm
+	}
+	return presenceMembers
+}
+
+func (c *RealtimePresence) InternalMembers() map[string]*PresenceMessage {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	internalMembers := make(map[string]*PresenceMessage, len(c.internalMembers))
+	for k, pm := range c.internalMembers {
+		internalMembers[k] = pm
+	}
+	return internalMembers
+}
+
+func (c *RealtimePresence) SyncInitial() bool {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	return c.syncState == syncInitial
+}
+
+func (c *RealtimePresence) SyncInProgress() bool {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	return c.syncState == syncInProgress
+}
+
 func (c *Connection) ConnectionStateTTL() time.Duration {
 	return c.connectionStateTTL()
+}
+
+func (r *Realtime) Logger() logger {
+	return r.log()
 }
 
 func NewInternalLogger(l Logger) logger {
@@ -211,17 +290,22 @@ type DurationFromMsecs = durationFromMsecs
 type ProtoErrorInfo = errorInfo
 type ProtoFlag = protoFlag
 type ProtocolMessage = protocolMessage
+type WebsocketErr = websocketErr
+
+func (w *WebsocketErr) HttpResp() *http.Response {
+	return w.resp
+}
 
 const (
 	DefaultCipherKeyLength = defaultCipherKeyLength
 	DefaultCipherAlgorithm = defaultCipherAlgorithm
 	DefaultCipherMode      = defaultCipherMode
 
-	AblyVersionHeader = ablyVersionHeader
-	AblyVersion       = ablyVersion
-	LibraryVersion    = libraryVersion
-	AblyAgentHeader   = ablyAgentHeader
-	AblySDKIdentifier = ablySDKIdentifier
+	AblyProtocolVersionHeader = ablyProtocolVersionHeader
+	AblyProtocolVersion       = ablyProtocolVersion
+	ClientLibraryVersion      = clientLibraryVersion
+	AblyAgentHeader           = ablyAgentHeader
+	AblySDKIdentifier         = ablySDKIdentifier
 
 	EncUTF8   = encUTF8
 	EncJSON   = encJSON
@@ -245,6 +329,7 @@ const (
 	ActionPresence     = actionPresence
 	ActionMessage      = actionMessage
 	ActionSync         = actionSync
+	ActionAuth         = actionAuth
 
 	FlagHasPresence       = flagHasPresence
 	FlagHasBacklog        = flagHasBacklog

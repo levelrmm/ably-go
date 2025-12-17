@@ -1,9 +1,11 @@
 package ably
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -15,27 +17,33 @@ import (
 	"time"
 
 	"github.com/ably/ably-go/ably/internal/ablyutil"
+	"github.com/ably/ably-go/ably/objects"
 )
 
 const (
 	protocolJSON    = "application/json"
 	protocolMsgPack = "application/x-msgpack"
 
-	// restHost is the primary ably host.
-	restHost = "rest.ably.io"
-	// realtimeHost is the primary ably host.
-	realtimeHost   = "realtime.ably.io"
-	Port           = 80
-	TLSPort        = 443
-	maxMessageSize = 65536 // 64kb, default value TO3l8
+	// defaultEndpoint is the default routing policy used to connect to Ably
+	defaultEndpoint    = "main"
+	defaultPrimaryHost = "main.realtime.ably.net" // REC1a
+
+	Port             = 80
+	TLSPort          = 443
+	defaultReadLimit = 1024 * 1024 * 2 // 2mb
+
+	// RTN17c
+	internetCheckUrl = "https://internet-up.ably-realtime.com/is-the-internet-up.txt"
+	internetCheckOk  = "yes"
 )
 
 var defaultOptions = clientOptions{
-	RESTHost:                 restHost,
-	FallbackHosts:            defaultFallbackHosts(),
+	Endpoint:                 defaultEndpoint,
+	RESTHost:                 defaultPrimaryHost,
+	FallbackHosts:            getEndpointFallbackHosts(defaultEndpoint), // REC2c1
 	HTTPMaxRetryCount:        3,
 	HTTPRequestTimeout:       10 * time.Second,
-	RealtimeHost:             realtimeHost,
+	RealtimeHost:             defaultPrimaryHost,
 	TimeoutDisconnect:        30 * time.Second,
 	ConnectionStateTTL:       120 * time.Second,
 	RealtimeRequestTimeout:   10 * time.Second, // DF1b
@@ -44,7 +52,7 @@ var defaultOptions = clientOptions{
 	HTTPOpenTimeout:          4 * time.Second,  //TO3l3
 	ChannelRetryTimeout:      15 * time.Second, // TO3l7
 	FallbackRetryTimeout:     10 * time.Minute,
-	IdempotentRESTPublishing: false,
+	IdempotentRESTPublishing: true, // TO3n
 	Port:                     Port,
 	TLSPort:                  TLSPort,
 	Now:                      time.Now,
@@ -52,23 +60,31 @@ var defaultOptions = clientOptions{
 	LogLevel:                 LogWarning, // RSC2
 }
 
-func defaultFallbackHosts() []string {
-	return []string{
-		"a.ably-realtime.com",
-		"b.ably-realtime.com",
-		"c.ably-realtime.com",
-		"d.ably-realtime.com",
-		"e.ably-realtime.com",
+func getPrimaryHost(root string) string {
+	// REC1b3
+	if strings.HasPrefix(root, "nonprod:") {
+		root := strings.TrimPrefix(root, "nonprod:")
+		return fmt.Sprintf("%s.realtime.ably-nonprod.net", root)
 	}
+	return fmt.Sprintf("%s.realtime.ably.net", root)
 }
 
-func getEnvFallbackHosts(env string) []string {
+func getEndpointFallbackHosts(endpoint string) []string {
+	if strings.HasPrefix(endpoint, "nonprod:") { // REC2c3
+		root := strings.TrimPrefix(endpoint, "nonprod:")
+		return endpointFallbacks(root, "ably-realtime-nonprod.com")
+	}
+	return endpointFallbacks(endpoint, "ably-realtime.com") // REC2c4
+}
+
+// endpointFallbacks generates a list of fallback hosts based on the given namespace and root.
+func endpointFallbacks(root, domain string) []string {
 	return []string{
-		fmt.Sprintf("%s-%s", env, "a-fallback.ably-realtime.com"),
-		fmt.Sprintf("%s-%s", env, "b-fallback.ably-realtime.com"),
-		fmt.Sprintf("%s-%s", env, "c-fallback.ably-realtime.com"),
-		fmt.Sprintf("%s-%s", env, "d-fallback.ably-realtime.com"),
-		fmt.Sprintf("%s-%s", env, "e-fallback.ably-realtime.com"),
+		fmt.Sprintf("%s.a.fallback.%s", root, domain),
+		fmt.Sprintf("%s.b.fallback.%s", root, domain),
+		fmt.Sprintf("%s.c.fallback.%s", root, domain),
+		fmt.Sprintf("%s.d.fallback.%s", root, domain),
+		fmt.Sprintf("%s.e.fallback.%s", root, domain),
 	}
 }
 
@@ -204,6 +220,15 @@ func (opts *authOptions) externalTokenAuthSupported() bool {
 	return !(opts.Token == "" && opts.TokenDetails == nil && opts.AuthCallback == nil && opts.AuthURL == "")
 }
 
+// VCDiffDecoder provides an interface for decoding vcdiff-encoded message payloads (VD1, VD2).
+// This interface must be implemented by plugins that provide vcdiff delta decoding functionality.
+type VCDiffDecoder interface {
+	// Decode decodes a vcdiff delta against a base payload and returns the target payload (VD2a, PC3a).
+	// The base argument should receive the stored base payload of the last message on a channel.
+	// If the base payload is a string it should be encoded to binary using UTF-8 before being passed.
+	Decode(delta []byte, base []byte) ([]byte, error)
+}
+
 func (opts *authOptions) merge(extra *authOptions, defaults bool) *authOptions {
 	ablyutil.Merge(opts, extra, defaults)
 	return opts
@@ -235,12 +260,14 @@ func (opts *authOptions) KeySecret() string {
 // clientOptions passes additional client-specific properties to the [ably.NewREST] or to the [ably.NewRealtime].
 // Properties set using [ably.clientOptions] are used instead of the [ably.defaultOptions] values.
 type clientOptions struct {
-
 	// authOptions Embedded an [ably.authOptions] object (TO3j).
 	authOptions
 
-	// RESTHost enables a non-default Ably host to be specified. For development environments only.
-	// The default value is rest.ably.io (RSC12, TO3k2).
+	// Endpoint specifies either a routing policy name or fully qualified domain name to connect to Ably.
+	Endpoint string
+
+	// Deprecated: this property is deprecated and will be removed in a future version.
+	// If the restHost option is specified the primary domain is the value of the restHost option REC1d1).
 	RESTHost string
 
 	// Deprecated: this property is deprecated and will be removed in a future version.
@@ -252,12 +279,14 @@ type clientOptions struct {
 	// please specify them here (RSC15b, RSC15a, TO3k6).
 	FallbackHosts []string
 
-	// RealtimeHost enables a non-default Ably host to be specified for realtime connections.
-	// For development environments only. The default value is realtime.ably.io (RTC1d, TO3k3).
+	// Deprecated: this property is deprecated and will be removed in a future version.
+	// If the realtimeHost option is specified the primary domain is the value of the realtimeHost option (REC1d2).
 	RealtimeHost string
 
-	// Environment enables a custom environment to be used with the Ably service.
-	// Optional: prefixes both hostname with the environment string (RSC15b, TO3k1).
+	// Deprecated: this property is deprecated and will be removed in a future version.
+	// If the deprecated environment option is specified then it defines a production routing policy name [name] (REC1c):
+	// If any one of the deprecated options restHost, realtimeHost are also specified then the options as a set are invalid (REC1c1).
+	// Otherwise, the primary domain is [name].realtime.ably.net (REC1c2).
 	Environment string
 
 	// Port is used for non-TLS connections and requests
@@ -282,7 +311,7 @@ type clientOptions struct {
 	// A recovery key string can be explicitly provided, or alternatively if a callback function is provided,
 	// the client library will automatically persist the recovery key between page reloads and call the callback
 	// when the connection is recoverable. The callback is then responsible for confirming whether the connection
-	// should be recovered or not. See connection state recovery for further information (RTC1c, TO3i).
+	// should be recovered or not. See connection state recovery for further information (RTC1c, TO3i, RTN16i).
 	Recover string
 
 	// TransportParams is a set of key-value pairs that can be used to pass in arbitrary connection parameters,
@@ -403,9 +432,35 @@ type clientOptions struct {
 	// LogHandler controls the log output of the library. This is a function to handle each line of log output.
 	// platform specific (TO3c)
 	LogHandler Logger
+
+	// InsecureAllowBasicAuthWithoutTLS permits an API key to be used even if the connection
+	// will not use TLS, something which would otherwise not be permitted for security reasons.
+	InsecureAllowBasicAuthWithoutTLS bool
+
+	// ExperimentalObjectsPlugin is the plugin to use to implement [LiveObjects] functionality.
+	//
+	// NOTE: this option is experimental, the LiveObjects plugin API may change in a
+	// backwards incompatible way between minor/patch versions. Once the API has been finalised,
+	// a new non-experimental option will be added, and this one will be removed.
+	//
+	// [LiveObjects]: https://ably.com/docs/liveobjects
+	ExperimentalObjectsPlugin objects.Plugin
+
+	// VCDiffPlugin is the plugin to use for decoding vcdiff-encoded message payloads (PC3).
+	// The plugin must implement the VCDiffDecoder interface and will be used to decode
+	// delta messages that have "vcdiff" in their encoding string.
+	VCDiffPlugin VCDiffDecoder
 }
 
 func (opts *clientOptions) validate() error {
+	// REC1b1
+	if !empty(opts.Endpoint) && (!empty(opts.Environment) || !empty(opts.RealtimeHost) || !empty(opts.RESTHost) || opts.FallbackHostsUseDefault) {
+		err := errors.New("invalid client option: cannot use endpoint with any of deprecated options environment, realtimeHost, restHost or FallbackHostsUseDefault")
+		logger := opts.LogHandler
+		logger.Printf(LogError, "Invalid client options : %v", err.Error())
+		return err
+	}
+
 	_, err := opts.getFallbackHosts()
 	if err != nil {
 		logger := opts.LogHandler
@@ -442,16 +497,22 @@ func (opts *clientOptions) activePort() (port int, isDefault bool) {
 }
 
 func (opts *clientOptions) getRestHost() string {
+	if !empty(opts.Endpoint) {
+		return opts.getHostnameFromEndpoint()
+	}
 	if !empty(opts.RESTHost) {
 		return opts.RESTHost
 	}
 	if !opts.isProductionEnvironment() {
-		return opts.Environment + "-" + defaultOptions.RESTHost
+		return getPrimaryHost(opts.Environment)
 	}
 	return defaultOptions.RESTHost
 }
 
 func (opts *clientOptions) getRealtimeHost() string {
+	if !empty(opts.Endpoint) {
+		return opts.getHostnameFromEndpoint()
+	}
 	if !empty(opts.RealtimeHost) {
 		return opts.RealtimeHost
 	}
@@ -461,9 +522,27 @@ func (opts *clientOptions) getRealtimeHost() string {
 		return opts.RESTHost
 	}
 	if !opts.isProductionEnvironment() {
-		return opts.Environment + "-" + defaultOptions.RealtimeHost
+		return getPrimaryHost(opts.Environment)
 	}
 	return defaultOptions.RealtimeHost
+}
+
+// REC1b2: isEndpointHostname returns true if the given endpoint is a hostname, which may
+// be an IPv4 address, IPv6 address or localhost
+func isEndpointHostname(endpoint string) bool {
+	return strings.Contains(endpoint, ".") || strings.Contains(endpoint, "::") || endpoint == "localhost"
+}
+
+// REC1b
+func (opts *clientOptions) getHostnameFromEndpoint() string {
+	endpoint := opts.Endpoint
+	if empty(endpoint) {
+		return defaultPrimaryHost
+	}
+	if isEndpointHostname(endpoint) { // REC1b2
+		return endpoint
+	}
+	return getPrimaryHost(endpoint) // REC1b4
 }
 
 func empty(s string) bool {
@@ -483,10 +562,10 @@ func (opts *clientOptions) restURL() (restUrl string) {
 	return "https://" + baseUrl
 }
 
-func (opts *clientOptions) realtimeURL() (realtimeUrl string) {
-	baseUrl := opts.getRealtimeHost()
+func (opts *clientOptions) realtimeURL(realtimeHost string) (realtimeUrl string) {
+	baseUrl := realtimeHost
 	_, _, err := net.SplitHostPort(baseUrl)
-	if err != nil { // set port if not set in baseUrl
+	if err != nil { // set port if not set in provided realtimeHost
 		port, _ := opts.activePort()
 		baseUrl = net.JoinHostPort(baseUrl, strconv.Itoa(port))
 	}
@@ -497,6 +576,16 @@ func (opts *clientOptions) realtimeURL() (realtimeUrl string) {
 }
 
 func (opts *clientOptions) getFallbackHosts() ([]string, error) {
+	if !empty(opts.Endpoint) {
+		if opts.FallbackHosts == nil {
+			if isEndpointHostname(opts.Endpoint) { // REC2c2
+				return opts.FallbackHosts, nil
+			}
+			return getEndpointFallbackHosts(opts.Endpoint), nil
+		}
+		return opts.FallbackHosts, nil //REC2a2
+	}
+
 	logger := opts.LogHandler
 	_, isDefaultPort := opts.activePort()
 	if opts.FallbackHostsUseDefault {
@@ -516,7 +605,7 @@ func (opts *clientOptions) getFallbackHosts() ([]string, error) {
 		if opts.isProductionEnvironment() {
 			return defaultOptions.FallbackHosts, nil
 		}
-		return getEnvFallbackHosts(opts.Environment), nil
+		return getEndpointFallbackHosts(opts.Environment), nil // REC2c5
 	}
 	return opts.FallbackHosts, nil
 }
@@ -594,6 +683,20 @@ func (opts *clientOptions) protocol() string {
 
 func (opts *clientOptions) idempotentRESTPublishing() bool {
 	return opts.IdempotentRESTPublishing
+}
+
+// RTN17c
+func (opts *clientOptions) hasActiveInternetConnection() bool {
+	res, err := opts.httpclient().Get(internetCheckUrl)
+	if err != nil || res.StatusCode != 200 {
+		return false
+	}
+	defer res.Body.Close()
+	data, err := io.ReadAll(res.Body)
+	if err != nil {
+		return false
+	}
+	return bytes.Contains(data, []byte(internetCheckOk))
 }
 
 type ScopeParams struct {
@@ -1047,9 +1150,23 @@ func WithEchoMessages(echo bool) ClientOption {
 	}
 }
 
-// WithEnvironment is used for setting Environment using [ably.ClientOption].
-// Environment enables a custom environment to be used with the Ably service.
-// Optional: prefixes both hostname with the environment string (RSC15b, TO3k1).
+// WithEndpoint sets a custom endpoint for connecting to the Ably service (see
+// [Platform Customization] for more information).
+//
+// [Platform Customization]: https://ably.com/docs/platform-customization
+func WithEndpoint(env string) ClientOption {
+	return func(os *clientOptions) {
+		os.Endpoint = env
+	}
+}
+
+// WithEnvironment sets a custom endpoint for connecting to the Ably service
+// (see [Platform Customization] for more information).
+//
+// Deprecated: this option is deprecated and will be removed in a future
+// version.
+//
+// [Platform Customization]: https://ably.com/docs/platform-customization
 func WithEnvironment(env string) ClientOption {
 	return func(os *clientOptions) {
 		os.Environment = env
@@ -1107,6 +1224,9 @@ func WithQueueMessages(queue bool) ClientOption {
 // WithRESTHost is used for setting RESTHost using [ably.ClientOption].
 // RESTHost enables a non-default Ably host to be specified. For development environments only.
 // The default value is rest.ably.io (RSC12, TO3k2).
+//
+// Deprecated: this option is deprecated and will be removed in a future
+// version.
 func WithRESTHost(host string) ClientOption {
 	return func(os *clientOptions) {
 		os.RESTHost = host
@@ -1126,6 +1246,9 @@ func WithHTTPRequestTimeout(timeout time.Duration) ClientOption {
 // WithRealtimeHost is used for setting RealtimeHost using [ably.ClientOption].
 // RealtimeHost enables a non-default Ably host to be specified for realtime connections.
 // For development environments only. The default value is realtime.ably.io (RTC1d, TO3k3).
+//
+// Deprecated: this option is deprecated and will be removed in a future
+// version.
 func WithRealtimeHost(host string) ClientOption {
 	return func(os *clientOptions) {
 		os.RealtimeHost = host
@@ -1297,9 +1420,41 @@ func WithDial(dial func(protocol string, u *url.URL, timeout time.Duration) (con
 	}
 }
 
+// WithInsecureAllowBasicAuthWithoutTLS permits an API key to be used even if the connection
+// will not use TLS, something which would otherwise not be permitted for security reasons.
+func WithInsecureAllowBasicAuthWithoutTLS() ClientOption {
+	return func(opts *clientOptions) {
+		opts.InsecureAllowBasicAuthWithoutTLS = true
+	}
+}
+
+// WithExperimentalObjectsPlugin configures the client to use the given plugin to implement
+// [LiveObjects] functionality.
+//
+// NOTE: this option is experimental, the LiveObjects plugin API may change in a
+// backwards incompatible way between minor/patch versions. Once the API has been finalised,
+// a new non-experimental option will be added, and this one will be removed.
+//
+// [LiveObjects]: https://ably.com/docs/liveobjects
+func WithExperimentalObjectsPlugin(plugin objects.Plugin) ClientOption {
+	return func(opts *clientOptions) {
+		opts.ExperimentalObjectsPlugin = plugin
+	}
+}
+
+// WithVCDiffPlugin configures the client to use the given plugin to decode vcdiff-encoded
+// delta messages (PC3). The plugin must implement the VCDiffDecoder interface.
+// This is required for channels that have delta encoding enabled with params {"delta": "vcdiff"}.
+func WithVCDiffPlugin(plugin VCDiffDecoder) ClientOption {
+	return func(opts *clientOptions) {
+		opts.VCDiffPlugin = plugin
+	}
+}
+
 func applyOptionsWithDefaults(opts ...ClientOption) *clientOptions {
 	to := defaultOptions
 	// No need to set hosts by default
+	to.Endpoint = ""
 	to.RESTHost = ""
 	to.RealtimeHost = ""
 	to.FallbackHosts = nil

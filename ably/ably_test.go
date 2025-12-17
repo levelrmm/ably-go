@@ -191,7 +191,7 @@ func (pc pipeConn) Close() error {
 // MessageRecorder
 type MessageRecorder struct {
 	mu       sync.Mutex
-	url      []*url.URL
+	urls     []*url.URL
 	sent     []*ably.ProtocolMessage
 	received []*ably.ProtocolMessage
 }
@@ -207,7 +207,7 @@ func NewMessageRecorder() *MessageRecorder {
 // Reset resets the recorded urls, sent and received messages
 func (rec *MessageRecorder) Reset() {
 	rec.mu.Lock()
-	rec.url = nil
+	rec.urls = nil
 	rec.sent = nil
 	rec.received = nil
 	rec.mu.Unlock()
@@ -216,7 +216,7 @@ func (rec *MessageRecorder) Reset() {
 // Dial
 func (rec *MessageRecorder) Dial(proto string, u *url.URL, timeout time.Duration) (ably.Conn, error) {
 	rec.mu.Lock()
-	rec.url = append(rec.url, u)
+	rec.urls = append(rec.urls, u)
 	rec.mu.Unlock()
 	conn, err := ably.DialWebsocket(proto, u, timeout)
 	if err != nil {
@@ -229,11 +229,11 @@ func (rec *MessageRecorder) Dial(proto string, u *url.URL, timeout time.Duration
 }
 
 // URL
-func (rec *MessageRecorder) URL() []*url.URL {
+func (rec *MessageRecorder) URLs() []*url.URL {
 	rec.mu.Lock()
 	defer rec.mu.Unlock()
-	newUrl := make([]*url.URL, len(rec.url))
-	copy(newUrl, rec.url)
+	newUrl := make([]*url.URL, len(rec.urls))
+	copy(newUrl, rec.urls)
 	return newUrl
 }
 
@@ -256,6 +256,25 @@ func (rec *MessageRecorder) CheckIfSent(action ably.ProtoAction, times int) func
 					return true
 				}
 			}
+		}
+		return false
+	}
+}
+
+func (rec *MessageRecorder) CheckIfReceived(action ably.ProtoAction, times int) func() bool {
+	return func() bool {
+		counter := 0
+		for _, m := range rec.Received() {
+			if m.Action == action {
+				counter++
+				if counter == times {
+					return true
+				}
+			}
+		}
+		// Check if no msg of given action type received
+		if times == 0 && counter == 0 {
+			return true
 		}
 		return false
 	}
@@ -337,7 +356,7 @@ func NewRecorder(httpClient *http.Client) *HostRecorder {
 
 func (hr *HostRecorder) Options(host string, opts ...ably.ClientOption) []ably.ClientOption {
 	return append(opts,
-		ably.WithRealtimeHost(host),
+		ably.WithEndpoint(host),
 		ably.WithAutoConnect(false),
 		ably.WithDial(hr.dialWS),
 		ably.WithHTTPClient(hr.httpClient),
@@ -480,16 +499,36 @@ func DialIntercept(dial DialFunc) (_ DialFunc, intercept func(context.Context, .
 	}, intercept
 }
 
+func DialWithMessagePreProcessor(msgCallback func(*ably.ProtocolMessage)) (wrappedDial DialFunc) {
+	active := &activeIntercept{}
+	active.Lock()
+	defer active.Unlock()
+	active.msgCallback = msgCallback
+
+	return func(proto string, url *url.URL, timeout time.Duration) (ably.Conn, error) {
+		conn, err := ably.DialWebsocket(proto, url, timeout)
+		if err != nil {
+			return nil, err
+		}
+		return interceptConn{conn, active}, nil
+	}
+}
+
 type activeIntercept struct {
 	sync.Mutex
-	ctx     context.Context
-	actions []ably.ProtoAction
-	msg     chan<- *ably.ProtocolMessage
+	ctx         context.Context
+	actions     []ably.ProtoAction
+	msg         chan<- *ably.ProtocolMessage
+	msgCallback func(*ably.ProtocolMessage)
 }
 
 type interceptConn struct {
 	ably.Conn
 	active *activeIntercept
+}
+
+func (c interceptConn) Unwrap() ably.Conn {
+	return c.Conn
 }
 
 func (c interceptConn) Receive(deadline time.Time) (*ably.ProtocolMessage, error) {
@@ -500,6 +539,10 @@ func (c interceptConn) Receive(deadline time.Time) (*ably.ProtocolMessage, error
 
 	c.active.Lock()
 	defer c.active.Unlock()
+
+	if c.active.msgCallback != nil {
+		c.active.msgCallback(msg)
+	}
 
 	if c.active.msg == nil {
 		return msg, err
@@ -522,3 +565,24 @@ var canceledCtx context.Context = func() context.Context {
 	cancel()
 	return ctx
 }()
+
+func assertSubset(t *testing.T, set []string, subset []string) {
+	t.Helper()
+	for _, item := range subset {
+		if !ablyutil.SliceContains(set, item) {
+			t.Errorf("expected %s got be in %s", item, set)
+		}
+	}
+}
+
+func assertUnique(t *testing.T, list []string) {
+	t.Helper()
+	hashSet := ablyutil.NewHashSet()
+	for _, item := range list {
+		if hashSet.Has(item) {
+			t.Errorf("duplicate item %s", item)
+		} else {
+			hashSet.Add(item)
+		}
+	}
+}

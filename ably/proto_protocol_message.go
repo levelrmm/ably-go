@@ -3,6 +3,8 @@ package ably
 import (
 	"fmt"
 	"time"
+
+	"github.com/ably/ably-go/ably/objects"
 )
 
 // TR3
@@ -16,6 +18,8 @@ const (
 	flagPublish           protoFlag = 1 << 17
 	flagSubscribe         protoFlag = 1 << 18
 	flagPresenceSubscribe protoFlag = 1 << 19
+	flagObjectSubscribe   protoFlag = 1 << 24
+	flagObjectPublish     protoFlag = 1 << 25
 )
 
 type protoFlag int64
@@ -116,6 +120,7 @@ func coerceInt64(v interface{}) int64 {
 type protocolMessage struct {
 	Messages          []*Message         `json:"messages,omitempty" codec:"messages,omitempty"`
 	Presence          []*PresenceMessage `json:"presence,omitempty" codec:"presence,omitempty"`
+	State             []*objects.Message `json:"state,omitempty" codec:"state,omitempty"`
 	ID                string             `json:"id,omitempty" codec:"id,omitempty"`
 	ApplicationID     string             `json:"applicationId,omitempty" codec:"applicationId,omitempty"`
 	ConnectionID      string             `json:"connectionId,omitempty" codec:"connectionId,omitempty"`
@@ -125,7 +130,6 @@ type protocolMessage struct {
 	ConnectionDetails *connectionDetails `json:"connectionDetails,omitempty" codec:"connectionDetails,omitempty"`
 	Error             *errorInfo         `json:"error,omitempty" codec:"error,omitempty"`
 	MsgSerial         int64              `json:"msgSerial" codec:"msgSerial"`
-	ConnectionSerial  int64              `json:"connectionSerial" codec:"connectionSerial"`
 	Timestamp         int64              `json:"timestamp,omitempty" codec:"timestamp,omitempty"`
 	Count             int                `json:"count,omitempty" codec:"count,omitempty"`
 	Action            protoAction        `json:"action,omitempty" codec:"action,omitempty"`
@@ -158,32 +162,35 @@ func (msg *protocolMessage) String() string {
 	case actionConnect:
 		return fmt.Sprintf("(action=%q)", msg.Action)
 	case actionConnected:
-		return fmt.Sprintf("(action=%q, id=%q, details=%#v)", msg.Action, msg.ConnectionID, msg.ConnectionDetails)
+		return fmt.Sprintf("(action=%q, id=%q, details=%#v, error=%s)", msg.Action, msg.ConnectionID, msg.ConnectionDetails, msg.Error)
 	case actionDisconnect:
 		return fmt.Sprintf("(action=%q)", msg.Action)
 	case actionDisconnected:
-		return fmt.Sprintf("(action=%q)", msg.Action)
+		return fmt.Sprintf("(action=%q, error=%s)", msg.Action, msg.Error)
 	case actionClose:
 		return fmt.Sprintf("(action=%q)", msg.Action)
 	case actionClosed:
 		return fmt.Sprintf("(action=%q)", msg.Action)
 	case actionError:
-		return fmt.Sprintf("(action=%q, error=%#v)", msg.Action, msg.Error)
+		return fmt.Sprintf("(action=%q, error=%s)", msg.Action, msg.Error)
 	case actionAttach:
 		return fmt.Sprintf("(action=%q, channel=%q)", msg.Action, msg.Channel)
 	case actionAttached:
-		return fmt.Sprintf("(action=%q, channel=%q, channelSerial=%q, flags=%x)",
-			msg.Action, msg.Channel, msg.ChannelSerial, msg.Flags)
+		return fmt.Sprintf("(action=%q, channel=%q, channelSerial=%q, flags=%x, error=%s)",
+			msg.Action, msg.Channel, msg.ChannelSerial, msg.Flags, msg.Error)
 	case actionDetach:
 		return fmt.Sprintf("(action=%q, channel=%q)", msg.Action, msg.Channel)
 	case actionDetached:
-		return fmt.Sprintf("(action=%q, channel=%q)", msg.Action, msg.Channel)
+		return fmt.Sprintf("(action=%q, channel=%q, error=%s)", msg.Action, msg.Channel, msg.Error)
 	case actionPresence, actionSync:
-		return fmt.Sprintf("(action=%q, id=%q, channel=%q, timestamp=%d, presenceMessages=%v)",
-			msg.Action, msg.ConnectionID, msg.Channel, msg.Timestamp, msg.Presence)
+		return fmt.Sprintf("(action=%q, id=%v, channel=%q, timestamp=%d, connectionId=%v, presenceMessages=%v)",
+			msg.Action, msg.ID, msg.Channel, msg.Timestamp, msg.ConnectionID, msg.Presence)
 	case actionMessage:
 		return fmt.Sprintf("(action=%q, id=%q, messages=%v)", msg.Action,
 			msg.ConnectionID, msg.Messages)
+	case actionAuth:
+		return fmt.Sprintf("(action=%q, id=%q, auth=%v)", msg.Action,
+			msg.ConnectionID, msg.Auth)
 	default:
 		return fmt.Sprintf("%#v", msg)
 	}

@@ -9,6 +9,8 @@ const (
 	ErrBadRequest                                ErrorCode = 40000
 	ErrInvalidCredential                         ErrorCode = 40005
 	ErrInvalidClientID                           ErrorCode = 40012
+	ErrDeltaDecodingFailed                       ErrorCode = 40018
+	ErrMissingPlugin                             ErrorCode = 40019
 	ErrUnauthorized                              ErrorCode = 40100
 	ErrInvalidCredentials                        ErrorCode = 40101
 	ErrIncompatibleCredentials                   ErrorCode = 40102
@@ -24,6 +26,7 @@ const (
 	ErrTimeoutError                              ErrorCode = 50003
 	ErrConnectionFailed                          ErrorCode = 80000
 	ErrConnectionSuspended                       ErrorCode = 80002
+	ErrConnectionClosed                          ErrorCode = 80017
 	ErrDisconnected                              ErrorCode = 80003
 	ErrProtocolError                             ErrorCode = 80013
 	ErrChannelOperationFailed                    ErrorCode = 90000

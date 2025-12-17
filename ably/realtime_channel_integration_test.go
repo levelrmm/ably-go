@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/ably/ably-go/ably"
+	"github.com/ably/ably-go/ably/internal/ablyutil"
 	"github.com/ably/ably-go/ablytest"
 
 	"github.com/stretchr/testify/assert"
@@ -269,18 +270,6 @@ func TestRealtimeChannel_AttachWhileDisconnected(t *testing.T) {
 	assert.NoError(t, err)
 }
 
-func TestRealtimeChannel_ShouldSetAblySandboxDefaultReadLimit(t *testing.T) {
-	app, client := ablytest.NewRealtime(ably.WithEchoMessages(false))
-	defer safeclose(t, ablytest.FullRealtimeCloser(client), app)
-	assert.Equal(t, int64(65536), client.Connection.ReadLimit()) // Default read limit when not connected
-
-	err := ablytest.Wait(ablytest.ConnWaiter(client, client.Connect, ably.ConnectionEventConnected), nil)
-	assert.NoError(t, err)
-
-	assert.Equal(t, int64(16384), client.Connection.ReadLimit()) // sandbox read limit
-	assert.False(t, client.Connection.IsReadLimitSetExternally())
-}
-
 func TestRealtimeChannel_ShouldSetProvidedReadLimit(t *testing.T) {
 	app, client := ablytest.NewRealtime(ably.WithEchoMessages(false))
 	defer safeclose(t, ablytest.FullRealtimeCloser(client), app)
@@ -289,8 +278,32 @@ func TestRealtimeChannel_ShouldSetProvidedReadLimit(t *testing.T) {
 	err := ablytest.Wait(ablytest.ConnWaiter(client, client.Connect, ably.ConnectionEventConnected), nil)
 	assert.NoError(t, err)
 
-	assert.True(t, client.Connection.IsReadLimitSetExternally())
 	assert.Equal(t, int64(2048), client.Connection.ReadLimit())
+}
+
+func TestRealtimeChannel_SetDefaultReadLimitIfServerHasNoLimit(t *testing.T) {
+
+	dial := func(proto string, url *url.URL, timeout time.Duration) (ably.Conn, error) {
+		return ably.DialWebsocket(proto, url, timeout)
+	}
+	wrappedDialWebsocket, interceptMsg := DialIntercept(dial)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	msgCh := interceptMsg(ctx, ably.ActionConnected)
+
+	app, client := ablytest.NewRealtime(ably.WithDial(wrappedDialWebsocket))
+	defer safeclose(t, ablytest.FullRealtimeCloser(client), app)
+	connectedWaiter := ablytest.ConnWaiter(client, nil, ably.ConnectionEventConnected)
+
+	connectedMsg := <-msgCh
+	connectedMsg.ConnectionDetails.MaxMessageSize = 0 // 0 represents limitless message size
+	cancel()                                          // unblocks updated message to be processed
+
+	err := ablytest.Wait(connectedWaiter, nil)
+	assert.Nil(t, err)
+
+	// If server set limit is 0, value is set to default readlimit
+	assert.Equal(t, int64(2097152), client.Connection.ReadLimit())
 }
 
 func TestRealtimeChannel_ShouldReturnErrorIfReadLimitExceeded(t *testing.T) {
@@ -305,7 +318,6 @@ func TestRealtimeChannel_ShouldReturnErrorIfReadLimitExceeded(t *testing.T) {
 	err = ablytest.Wait(ablytest.ConnWaiter(client2, client2.Connect, ably.ConnectionEventConnected), nil)
 	assert.NoError(t, err)
 
-	assert.True(t, client2.Connection.IsReadLimitSetExternally())
 	assert.Equal(t, int64(1024), client2.Connection.ReadLimit())
 
 	channel1 := client1.Channels.Get("test")
@@ -320,7 +332,7 @@ func TestRealtimeChannel_ShouldReturnErrorIfReadLimitExceeded(t *testing.T) {
 	assert.NoError(t, err, "client2:.Subscribe(context.Background())=%v", err)
 	defer unsub2()
 
-	messageWith2MbSize := ablytest.GenerateRandomString(2048)
+	messageWith2MbSize := ablyutil.GenerateRandomString(2048)
 	err = channel1.Publish(context.Background(), "hello", messageWith2MbSize)
 	assert.NoError(t, err, "client1: Publish()=%v", err)
 

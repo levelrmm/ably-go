@@ -6,13 +6,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"log"
 	"net"
 	"net/http"
 	"net/url"
 	"os"
 	"path"
+	"strings"
+	"syscall"
 	"time"
 
 	"github.com/ably/ably-go/ably"
@@ -98,10 +100,9 @@ var PresenceFixtures = func() []Presence {
 }
 
 type Sandbox struct {
-	Config      *Config
-	Environment string
-
-	client *http.Client
+	Config   *Config
+	Endpoint string
+	client   *http.Client
 }
 
 func NewRealtime(opts ...ably.ClientOption) (*Sandbox, *ably.Realtime) {
@@ -131,14 +132,14 @@ func MustSandbox(config *Config) *Sandbox {
 }
 
 func NewSandbox(config *Config) (*Sandbox, error) {
-	return NewSandboxWithEnv(config, Environment)
+	return NewSandboxWithEndpoint(config, Endpoint)
 }
 
-func NewSandboxWithEnv(config *Config, env string) (*Sandbox, error) {
+func NewSandboxWithEndpoint(config *Config, endpoint string) (*Sandbox, error) {
 	app := &Sandbox{
-		Config:      config,
-		Environment: env,
-		client:      NewHTTPClient(),
+		Config:   config,
+		Endpoint: endpoint,
+		client:   NewHTTPClient(),
 	}
 	if app.Config == nil {
 		app.Config = DefaultConfig()
@@ -159,13 +160,15 @@ func NewSandboxWithEnv(config *Config, env string) (*Sandbox, error) {
 		req.Header.Set("Accept", "application/json")
 		resp, err := app.client.Do(req)
 		if err != nil {
-			// return from this function now only if the error wasn't due to a timeout
-			if err, ok := err.(*url.Error); ok && !err.Timeout() {
-				return nil, err
+			if !errors.Is(err, syscall.ECONNRESET) { // if not connection reset by peer
+				// return error if it wasn't due to a timeout
+				if err, ok := err.(*url.Error); ok && !err.Timeout() {
+					return nil, err
+				}
 			}
 		}
 
-		if err != nil {
+		if err != nil || (resp != nil && resp.StatusCode == 504) { // gateway timeout
 			// Timeout. Back off before allowing another attempt.
 			log.Println("warn: request timeout, attempting retry")
 			time.Sleep(retryInterval)
@@ -174,7 +177,7 @@ func NewSandboxWithEnv(config *Config, env string) (*Sandbox, error) {
 			defer resp.Body.Close()
 			if resp.StatusCode > 299 {
 				err := errors.New(http.StatusText(resp.StatusCode))
-				if p, e := ioutil.ReadAll(resp.Body); e == nil && len(p) != 0 {
+				if p, e := io.ReadAll(resp.Body); e == nil && len(p) != 0 {
 					err = fmt.Errorf("request error: %s (%q)", err, p)
 				}
 				return nil, err
@@ -230,7 +233,7 @@ func (app *Sandbox) Options(opts ...ably.ClientOption) []ably.ClientOption {
 	appHTTPClient := NewHTTPClient()
 	appOpts := []ably.ClientOption{
 		ably.WithKey(app.Key()),
-		ably.WithEnvironment(app.Environment),
+		ably.WithEndpoint(app.Endpoint),
 		ably.WithUseBinaryProtocol(!NoBinaryProtocol),
 		ably.WithHTTPClient(appHTTPClient),
 		ably.WithLogLevel(DefaultLogLevel),
@@ -238,20 +241,85 @@ func (app *Sandbox) Options(opts ...ably.ClientOption) []ably.ClientOption {
 
 	// If opts want to record round trips inject the recording transport
 	// via TransportHijacker interface.
-	opt := MergeOptions(opts)
-	if httpClient := ClientOptionsInspector.HTTPClient(opt); httpClient != nil {
+	if httpClient := ClientOptionsInspector.HTTPClient(opts); httpClient != nil {
 		if hijacker, ok := httpClient.Transport.(transportHijacker); ok {
 			appHTTPClient.Transport = hijacker.Hijack(appHTTPClient.Transport)
-			opt = append(opt, ably.WithHTTPClient(appHTTPClient))
+			opts = append(opts, ably.WithHTTPClient(appHTTPClient))
 		}
 	}
-	appOpts = MergeOptions(appOpts, opt)
+	appOpts = MergeOptions(appOpts, opts)
 
 	return appOpts
 }
 
 func (app *Sandbox) URL(paths ...string) string {
-	return "https://" + app.Environment + "-rest.ably.io/" + path.Join(paths...)
+	if strings.HasPrefix(app.Endpoint, "nonprod:") {
+		namespace := strings.TrimPrefix(app.Endpoint, "nonprod:")
+		return fmt.Sprintf("https://%s.realtime.ably-nonprod.net/%s", namespace, path.Join(paths...))
+	}
+
+	return fmt.Sprintf("https://%s.realtime.ably.net/%s", app.Endpoint, path.Join(paths...))
+}
+
+// Source code for the same => https://github.com/ably/echoserver/blob/main/app.js
+var CREATE_JWT_URL string = "https://echo.ably.io/createJWT"
+
+// GetJwtAuthParams constructs the authentication parameters required for JWT creation.
+// Required when authUrl is chosen as a mode of auth
+//
+// Parameters:
+// - expiresIn: The duration until the JWT expires.
+// - invalid: A boolean flag indicating whether to use an invalid key secret.
+//
+// Returns: A url.Values object containing the authentication parameters.
+func (app *Sandbox) GetJwtAuthParams(expiresIn time.Duration, invalid bool) url.Values {
+	key, secret := app.KeyParts()
+	authParams := url.Values{}
+	authParams.Add("endpoint", app.Endpoint)
+	authParams.Add("returnType", "jwt")
+	authParams.Add("keyName", key)
+	if invalid {
+		authParams.Add("keySecret", "invalid")
+	} else {
+		authParams.Add("keySecret", secret)
+	}
+	authParams.Add("expiresIn", fmt.Sprint(expiresIn.Seconds()))
+	return authParams
+}
+
+// CreateJwt generates a JWT with the specified expiration time.
+//
+// Parameters:
+// - expiresIn: The duration until the JWT expires.
+// - invalid: A boolean flag indicating whether to use an invalid key secret.
+//
+// Returns:
+// - A string containing the generated JWT.
+// - An error if the JWT creation fails.
+func (app *Sandbox) CreateJwt(expiresIn time.Duration, invalid bool) (string, error) {
+	u, err := url.Parse(CREATE_JWT_URL)
+	if err != nil {
+		return "", err
+	}
+	u.RawQuery = app.GetJwtAuthParams(expiresIn, invalid).Encode()
+	req, err := http.NewRequest(http.MethodGet, u.String(), nil)
+	if err != nil {
+		return "", fmt.Errorf("client: could not create request: %s", err)
+	}
+	res, err := app.client.Do(req)
+	if err != nil {
+		res.Body.Close()
+		return "", fmt.Errorf("client: error making http request: %s", err)
+	}
+	defer res.Body.Close()
+	resBody, err := io.ReadAll(res.Body)
+	if err != nil {
+		return "", fmt.Errorf("client: could not read response body: %s", err)
+	}
+	if res.StatusCode != 200 {
+		return "", fmt.Errorf("non-success response received: %v:%s", res.StatusCode, resBody)
+	}
+	return string(resBody), nil
 }
 
 func NewHTTPClient() *http.Client {
